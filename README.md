@@ -7,7 +7,7 @@ One server — works with any tool that speaks OpenAI or Anthropic format: Curso
 ## 30-second setup
 
 ```bash
-git clone https://github.com/<you>/opencode-zen-free-proxy.git
+git clone https://github.com/dinhkarate/opencode-zen-free-proxy.git
 cd opencode-zen-free-proxy
 npm install
 node server.mjs
@@ -125,7 +125,7 @@ Add to `~/.config/opencode/opencode.json`:
 
 ```bash
 # On your VPS
-git clone https://github.com/<you>/opencode-zen-free-proxy.git
+git clone https://github.com/dinhkarate/opencode-zen-free-proxy.git
 cd opencode-zen-free-proxy
 npm install
 node server.mjs          # foreground
