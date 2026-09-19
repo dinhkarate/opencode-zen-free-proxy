@@ -38,7 +38,7 @@ Smoke test:
 
 ```bash
 curl http://localhost:6446/health
-# {"status":"ok","version":"v10","models":5,...}
+# {"status":"ok","version":"v11","models":6,...}
 ```
 
 ## Models
@@ -48,6 +48,7 @@ curl http://localhost:6446/health
 | `big-pickle` | `/v1/chat/completions` | DeepSeek V4 Flash (stealth) | Solid |
 | `mimo-v2.5-free` | `/v1/chat/completions` | MiMo V2.5 | Solid, streams reasoning |
 | `nemotron-3-ultra-free` | `/v1/chat/completions` | NVIDIA Nemotron 3 Ultra | Slower, occasional upstream 503s |
+| `ling-3.0-flash-fin-free` | `/v1/chat/completions` | Ling 3.0 Flash | Solid |
 | `muse-spark-1.3-contributor-free` | `/v1/responses` | Muse Spark 1.3 | Solid |
 | `muse-spark-1.2-contributor-free` | `/v1/responses` | Muse Spark 1.2 | Solid |
 
@@ -131,7 +132,8 @@ Add a `localzen` provider to `~/.config/opencode/opencode.jsonc` (useful when th
       "models": {
         "big-pickle": { "name": "big-pickle" },
         "mimo-v2.5-free": { "name": "mimo-v2.5-free" },
-        "nemotron-3-ultra-free": { "name": "nemotron-3-ultra-free" }
+        "nemotron-3-ultra-free": { "name": "nemotron-3-ultra-free" },
+        "ling-3.0-flash-fin-free": { "name": "ling-3.0-flash-fin-free" }
       }
     }
   }
@@ -189,6 +191,33 @@ For chat-in-opencode use `big-pickle` / `mimo-v2.5-free` / `nemotron-3-ultra-fre
 - API Key: your key from `api-keys.json`
 - Model: `big-pickle` (or any chat model from the table)
 - `muse-spark-*` appear in `/v1/models` but return `400` on the chat endpoint — they need `/v1/responses` clients.
+
+### Chaining behind cli-proxy-api (advanced)
+
+This is the vina2 production topology: CPA fronts dozens of upstream CLIs/APIs
+and treats this proxy as one more upstream provider (the zen free-tier models
+become `oc/*` chat models plus `muse-spark-*` on the responses side):
+
+```yaml
+# CPA config.yaml — the proxy handles all zen-specific headers itself,
+# CPA just talks plain OpenAI/Responses to it:
+openai-compatibility:
+  - name: OpenCode-zen-via-local-proxy
+    base-url: http://127.0.0.1:6446/v1
+    api-key-entries:
+      - api-key: <key from api-keys.json>
+    models:
+      - { name: big-pickle, alias: "" }
+codex-api-key:
+  - api-key: <key from api-keys.json>
+    base-url: http://127.0.0.1:6446/v1
+    disable-cooling: true
+    models:
+      - { name: muse-spark-1.3-contributor-free, alias: muse-spark-1.3, is-compat: true }
+```
+
+When chained on the same box, run the proxy with `PROXY_HOST=127.0.0.1` so the
+free-tier gateway never gets exposed publicly.
 
 ### Raw curl sanity check
 

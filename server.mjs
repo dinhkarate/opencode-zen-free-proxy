@@ -14,7 +14,7 @@ const HOST = process.env.PROXY_HOST || "0.0.0.0";
 const OC_VERSION = "1.18.31";
 const UA_CHAT = `opencode/${OC_VERSION} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14`;
 const UA_RESPONSES = `opencode/${OC_VERSION} ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14`;
-const PROXY_VERSION = "10";
+const PROXY_VERSION = "11";
 
 // ── API Keys ───────────────────────────────────────────────────────
 const keysFile = process.env.KEYS_FILE || "./api-keys.json";
@@ -76,6 +76,7 @@ const CHAT_MODELS = [
   "big-pickle",
   "mimo-v2.5-free",
   "nemotron-3-ultra-free",
+  "ling-3.0-flash-fin-free",
 ];
 const RESPONSES_MODELS = [
   "muse-spark-1.3-contributor-free",
