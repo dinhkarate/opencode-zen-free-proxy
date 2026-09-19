@@ -227,6 +227,21 @@ curl -s http://localhost:6446/v1/chat/completions \
   -d '{"model":"big-pickle","messages":[{"role":"user","content":"ping"}]}'
 ```
 
+## Load testing
+
+Bundled zero-dep tool (also works against any OpenAI-compatible API — OpenAI,
+OpenRouter, vLLM, LM Studio...):
+
+```bash
+node stress-test.mjs -k YOUR_KEY                       # smoke: conc=1, 10 reqs
+node stress-test.mjs -k YOUR_KEY -c 1,5,10,20 -n 10   # concurrency ramp
+node stress-test.mjs -k YOUR_KEY -m muse-spark-1.3-contributor-free --responses
+node stress-test.mjs -k YOUR_KEY --stream             # measures time-to-first-token
+node stress-test.mjs --help                           # all options / machine-readable --json report
+```
+
+Exit code 0 = clean run, 1 = failures observed — safe to wire into CI or agent loops.
+
 ## Deploy on a VPS
 
 ```bash
