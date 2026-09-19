@@ -7,6 +7,9 @@ const app = express();
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PROXY_PORT || 6446;
+// Bind address: default 0.0.0.0 for local use; set PROXY_HOST=127.0.0.1 on
+// public VPSes (front them via a reverse proxy or SSH tunnel instead).
+const HOST = process.env.PROXY_HOST || "0.0.0.0";
 // Must stay >= 1.18.0 — older clients get 426 UpgradeRequired on free tier.
 const OC_VERSION = "1.18.31";
 const UA_CHAT = `opencode/${OC_VERSION} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14`;
@@ -831,8 +834,8 @@ app.get("/health", (_req, res) => res.json({
 }));
 
 // ── Start ──────────────────────────────────────────────────────────
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`OpenCode Free Proxy v${PROXY_VERSION} on http://0.0.0.0:${PORT}`);
+app.listen(PORT, HOST, () => {
+  console.log(`OpenCode Free Proxy v${PROXY_VERSION} on http://${HOST}:${PORT}`);
   console.log("  OpenAI:    POST /v1/chat/completions  (big-pickle, mimo-v2.5-free, nemotron-3-ultra-free)");
   console.log("  Responses: POST /v1/responses         (muse-spark-*-contributor-free)");
   console.log("  Anthropic: POST /v1/messages");

@@ -209,12 +209,16 @@ node server.mjs                              # foreground
 nohup node server.mjs > proxy.log 2>&1 &     # background
 ```
 
-Keep the port private and tunnel in:
+On a public VPS, bind loopback only (`PROXY_HOST=127.0.0.1`) and tunnel in:
 
 ```bash
+PROXY_HOST=127.0.0.1 nohup node server.mjs > proxy.log 2>&1 &
 ssh -L 6446:127.0.0.1:6446 user@your-vps
 # Now http://localhost:6446 works locally
 ```
+
+Local tools on the same box (e.g. cli-proxy-api) can just point at
+`http://127.0.0.1:6446/v1`.
 
 ### systemd service (optional)
 
@@ -245,6 +249,7 @@ sudo systemctl enable --now opencode-zen-proxy
 | Variable | Default | What |
 |----------|---------|------|
 | `PROXY_PORT` | `6446` | Server port |
+| `PROXY_HOST` | `0.0.0.0` | Bind address — use `127.0.0.1` on public VPSes |
 | `KEYS_FILE` | `./api-keys.json` | API keys file path |
 
 ## How it works
