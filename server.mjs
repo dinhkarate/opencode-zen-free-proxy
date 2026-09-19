@@ -14,7 +14,7 @@ const HOST = process.env.PROXY_HOST || "0.0.0.0";
 const OC_VERSION = "1.18.31";
 const UA_CHAT = `opencode/${OC_VERSION} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14`;
 const UA_RESPONSES = `opencode/${OC_VERSION} ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14`;
-const PROXY_VERSION = "11";
+const PROXY_VERSION = "12";
 
 // ── API Keys ───────────────────────────────────────────────────────
 const keysFile = process.env.KEYS_FILE || "./api-keys.json";
@@ -111,6 +111,45 @@ function ensureResponsesTools(tools) {
   return list;
 }
 
+// ── Reasoning / thinking controls ──────────────────────────────────
+// Zen schema: reasoning.effort ∈ none|minimal|low|medium|high|xhigh|max.
+// Probed live against muse-spark: minimal..xhigh actually work; `none` and
+// `max` pass schema validation but the muse provider rejects them, so for
+// muse models we clamp max->xhigh / none->minimal. Chat models receive
+// `reasoning` too (mimo honours it; non-reasoning models ignore it silently).
+const EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+const MUSE_MODELS = RESPONSES_MODELS;
+
+function pickEffort(v) {
+  // v: string | {effort} | undefined → canonical effort string or null
+  const raw = typeof v === "string" ? v : v?.effort;
+  if (!raw) return null;
+  const e = String(raw).toLowerCase();
+  return EFFORTS.includes(e) ? e : undefined; // undefined = invalid
+}
+function applyEffort(model, effort, log) {
+  if (!MUSE_MODELS.includes(model) || !effort) return effort;
+  // muse upstream truth (probed): minimal..xhigh actually work;
+  // `none` and `max` appear in some error enums but are provider-rejected.
+  if (effort === "max" || effort === "none") {
+    const clamped = effort === "max" ? "xhigh" : "minimal";
+    log("clamp", effort + "->" + clamped, "for", model);
+    return clamped;
+  }
+  return effort;
+}
+
+// Anthropic thinking.budget_tokens → effort tier (budgets <1024 are invalid
+// for Anthropic clients anyway).
+function budgetToEffort(budget) {
+  if (!Number.isFinite(budget)) return null;
+  if (budget <= 1024) return "minimal";
+  if (budget <= 2048) return "low";
+  if (budget <= 4096) return "medium";
+  if (budget <= 12288) return "high";
+  return "xhigh";
+}
+
 // Track sessions per user (rotate every 30 min)
 const userSessions = {};
 function getSession(user) {
@@ -125,9 +164,10 @@ function getSession(user) {
 // Free tier only serves stream:true requests carrying bash+read tools,
 // so we ALWAYS request SSE upstream and aggregate locally when the
 // downstream client asked for a non-streaming response.
-function zenRequest(model, messages, tools, tool_choice, sessionId, max_tokens) {
+function zenRequest(model, messages, tools, tool_choice, sessionId, max_tokens, effort) {
   const reqBody = { model, messages, stream: true, stream_options: { include_usage: true } };
   reqBody.tools = ensureChatTools(tools);
+  if (effort) reqBody.reasoning = { effort };
   if (tool_choice) reqBody.tool_choice = tool_choice;
   if (max_tokens) reqBody.max_tokens = max_tokens;
   const body = JSON.stringify(reqBody);
@@ -319,6 +359,7 @@ function collectChatSSE(build, model, attempts = 2) {
           } catch {}
         }
         let content = "";
+        let reasoning = "";
         const toolMap = new Map();
         let finishReason = "stop";
         let usage;
@@ -330,7 +371,10 @@ function collectChatSSE(build, model, attempts = 2) {
           if (p.created) created = p.created;
           const delta = choice.delta || {};
           if (typeof delta.content === "string") content += delta.content;
-          if (delta.reasoning_content && !content) content += delta.reasoning_content;
+          if (typeof delta.reasoning === "string") reasoning += delta.reasoning;
+          else if (typeof delta.reasoning_content === "string") reasoning += delta.reasoning_content;
+          else if (Array.isArray(delta.reasoning_details))
+            reasoning += delta.reasoning_details.map(d => d.text || "").join("");
           for (const tc of delta.tool_calls || []) {
             const idx = tc.index ?? 0;
             if (!toolMap.has(idx)) toolMap.set(idx, { id: tc.id, name: "", args: "" });
@@ -353,6 +397,7 @@ function collectChatSSE(build, model, attempts = 2) {
             function: { name: t.name, arguments: t.args || "{}" },
           }));
         const message = { role: "assistant", content: content || null };
+        if (reasoning) message.reasoning = reasoning;
         if (tool_calls.length) message.tool_calls = tool_calls;
         resolve({
           status: 200,
@@ -489,6 +534,10 @@ function openAIToAnthropic(oaiResp, model, inputTokens) {
   }
 
   const content = [];
+  if (choice.message?.reasoning) {
+    // Anthropic extended-thinking block (signature is proxy-issued, not real)
+    content.push({ type: "thinking", thinking: choice.message.reasoning, signature: "" });
+  }
   if (choice.message?.content) {
     content.push({ type: "text", text: choice.message.content });
   }
@@ -536,9 +585,11 @@ function pipeZenAsAnthropic(build, model, res, inputTokens, attempts = 2) {
     let headersSent = false;
     let buffer = "";
     let outputTokens = 0;
-    let contentIdx = 0;
-    let toolIdx = -1;
+    let thinkingIdx = -1, textIdx = -1, blockCount = 0;
+    const toolBlocks = new Map();
+    const openBlocks = [];           // block indices still missing content_block_stop
     let firstChunkHandled = false;
+    let finished = false;            // upstream may repeat finish_reason
 
     function sendSSE(event, data) {
       res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -564,6 +615,29 @@ function pipeZenAsAnthropic(build, model, res, inputTokens, attempts = 2) {
           usage: { input_tokens: inputTokens || 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
         },
       });
+    }
+
+    // Close every open block (reverse order); thinking gets a signature delta first.
+    function closeAllOpen() {
+      for (let i = openBlocks.length - 1; i >= 0; i--) {
+        const idx = openBlocks[i];
+        if (idx === thinkingIdx) {
+          sendSSE("content_block_delta", {
+            type: "content_block_delta", index: idx,
+            delta: { type: "signature_delta", signature: "" },
+          });
+        }
+        sendSSE("content_block_stop", { type: "content_block_stop", index: idx });
+      }
+      openBlocks.length = 0;
+    }
+
+    function startBlock(blockObj) {
+      closeAllOpen();
+      const idx = blockCount++;
+      sendSSE("content_block_start", { type: "content_block_start", index: idx, content_block: blockObj });
+      openBlocks.push(idx);
+      return idx;
     }
 
     zenRes.on("data", (chunk) => {
@@ -609,60 +683,58 @@ function pipeZenAsAnthropic(build, model, res, inputTokens, attempts = 2) {
 
         let parsed;
         try { parsed = JSON.parse(payload); } catch { continue; }
-        const delta = parsed.choices?.[0]?.delta;
+        const choice = parsed.choices?.[0];
+        const delta = choice?.delta;
         if (!delta) continue;
 
         sendHeaders();
 
-        // Text content
-        if (delta.content) {
-          if (contentIdx === 0 && toolIdx === -1) {
-            sendSSE("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
-            contentIdx = 1;
+        // Reasoning → thinking block (start once; stream deltas into it)
+        const rTxt = typeof delta.reasoning === "string" ? delta.reasoning
+          : typeof delta.reasoning_content === "string" ? delta.reasoning_content
+          : Array.isArray(delta.reasoning_details) ? delta.reasoning_details.map(d => d.text || "").join("") : "";
+        if (rTxt) {
+          if (thinkingIdx < 0 && textIdx < 0) thinkingIdx = startBlock({ type: "thinking", thinking: "" });
+          if (thinkingIdx >= 0 && openBlocks.includes(thinkingIdx)) {
+            sendSSE("content_block_delta", {
+              type: "content_block_delta", index: thinkingIdx,
+              delta: { type: "thinking_delta", thinking: rTxt },
+            });
+            outputTokens += Math.ceil(rTxt.length / 4);
           }
+        }
+
+        // Text content → text block
+        if (delta.content) {
+          if (textIdx < 0) textIdx = startBlock({ type: "text", text: "" });
           sendSSE("content_block_delta", {
-            type: "content_block_delta", index: 0,
+            type: "content_block_delta", index: textIdx,
             delta: { type: "text_delta", text: delta.content },
           });
           outputTokens += Math.ceil(delta.content.length / 4);
         }
 
-        // Tool calls
-        if (delta.tool_calls) {
-          for (const tc of delta.tool_calls) {
-            const idx = tc.index ?? 0;
-            if (idx > toolIdx) {
-              // Close previous text block if open
-              if (toolIdx === -1 && contentIdx > 0) {
-                sendSSE("content_block_stop", { type: "content_block_stop", index: 0 });
-              }
-              toolIdx = idx;
-              const blockIdx = contentIdx > 0 ? idx + 1 : idx;
-              sendSSE("content_block_start", {
-                type: "content_block_start", index: blockIdx,
-                content_block: { type: "tool_use", id: tc.id || ocId("toolu"), name: tc.function?.name || "" },
-              });
-            }
-            if (tc.function?.arguments) {
-              const blockIdx = contentIdx > 0 ? idx + 1 : idx;
-              sendSSE("content_block_delta", {
-                type: "content_block_delta", index: blockIdx,
-                delta: { type: "input_json_delta", partial_json: tc.function.arguments },
-              });
-              outputTokens += Math.ceil(tc.function.arguments.length / 4);
-            }
+        // Tool calls → one tool_use block per upstream tool-call index
+        for (const tc of delta.tool_calls || []) {
+          const tIdx = tc.index ?? 0;
+          if (!toolBlocks.has(tIdx)) toolBlocks.set(tIdx, startBlock({
+            type: "tool_use", id: tc.id || ocId("toolu"), name: tc.function?.name || "",
+          }));
+          const blockIdx = toolBlocks.get(tIdx);
+          if (tc.function?.arguments) {
+            sendSSE("content_block_delta", {
+              type: "content_block_delta", index: blockIdx,
+              delta: { type: "input_json_delta", partial_json: tc.function.arguments },
+            });
+            outputTokens += Math.ceil(tc.function.arguments.length / 4);
           }
         }
 
-        // Finish
-        if (parsed.choices?.[0]?.finish_reason) {
-          const fr = parsed.choices[0].finish_reason;
-          // Close open blocks
-          const totalBlocks = (contentIdx > 0 ? 1 : 0) + (toolIdx >= 0 ? toolIdx + 1 : 0);
-          for (let i = 0; i < totalBlocks; i++) {
-            sendSSE("content_block_stop", { type: "content_block_stop", index: i });
-          }
-
+        // Finish (guard: upstream may repeat finish_reason in trailing chunks)
+        if (choice?.finish_reason && !finished) {
+          finished = true;
+          closeAllOpen();
+          const fr = choice.finish_reason;
           let stopReason = "end_turn";
           if (fr === "tool_calls") stopReason = "tool_use";
           else if (fr === "length") stopReason = "max_tokens";
@@ -684,6 +756,7 @@ function pipeZenAsAnthropic(build, model, res, inputTokens, attempts = 2) {
         }
         return;
       }
+      if (openBlocks.length) closeAllOpen();  // upstream died without finish_reason
       res.end();
     });
   });
@@ -724,12 +797,16 @@ app.post("/v1/chat/completions", async (req, res) => {
   if (!CHAT_MODELS.includes(model)) {
     return res.status(400).json({ error: { message: `Unknown model: ${model}. Chat models: ${CHAT_MODELS.join(", ")}. Responses models: ${RESPONSES_MODELS.join(", ")}` } });
   }
+  const effort = pickEffort(req.body.reasoning ?? req.body.reasoning_effort);
+  if (effort === undefined) {
+    return res.status(400).json({ error: { message: `Invalid reasoning effort. Accepted: ${EFFORTS.join(", ")}.`, type: "invalid_request_error" } });
+  }
 
   const sessionId = getSession(user);
   const msgSummary = (messages || []).map(m => ({ role: m.role, len: (typeof m.content === "string" ? m.content : JSON.stringify(m.content || "")).length }));
-  console.log("[OAI]", new Date().toISOString(), user, model, stream ? "stream" : "sync", "msgs:", JSON.stringify(msgSummary));
+  console.log("[OAI]", new Date().toISOString(), user, model, stream ? "stream" : "sync", "effort:", effort || "default", "msgs:", JSON.stringify(msgSummary));
 
-  const buildChat = () => zenRequest(model, messages, tools, tool_choice, sessionId, max_tokens);
+  const buildChat = () => zenRequest(model, messages, tools, tool_choice, sessionId, max_tokens, applyEffort(model, effort, console.log));
   if (stream) {
     pipeZenResponse(buildChat, res);
   } else {
@@ -760,12 +837,18 @@ app.post("/v1/responses", async (req, res) => {
     return res.status(400).json({ error: { message: `Unknown model: ${model}. Responses models: ${RESPONSES_MODELS.join(", ")}` } });
   }
 
+  const effort = pickEffort(reasoning);
+  if (effort === undefined) {
+    return res.status(400).json({ error: { message: `Invalid reasoning effort. Accepted: ${EFFORTS.join(", ")}. (muse models support up to xhigh; max is auto-clamped.)`, type: "invalid_request_error" } });
+  }
+  const upstreamEffort = applyEffort(model, effort, console.log);
+
   const sessionId = getSession(user);
-  console.log("[RSP]", new Date().toISOString(), user, model, stream ? "stream" : "sync",
+  console.log("[RSP]", new Date().toISOString(), user, model, stream ? "stream" : "sync", "effort:", upstreamEffort || "default",
     "inputLen:", JSON.stringify(input || "").length);
 
   const buildResp = () => zenRequestResponses(model, input, tools, tool_choice, sessionId,
-    { max_output_tokens, instructions, reasoning });
+    { max_output_tokens, instructions, reasoning: upstreamEffort ? { effort: upstreamEffort } : reasoning });
   if (stream) {
     pipeZenResponse(buildResp, res);
   } else {
@@ -801,13 +884,24 @@ app.post("/v1/messages", async (req, res) => {
     });
   }
 
+  const rawReasoning = req.body.reasoning ?? req.body.reasoning_effort;
+  const parsedEffort = rawReasoning !== undefined && rawReasoning !== null ? pickEffort(rawReasoning) : null;
+  if (parsedEffort === undefined) {
+    return res.status(400).json({
+      type: "error",
+      error: { type: "invalid_request_error", message: `Invalid reasoning effort. Accepted: ${EFFORTS.join(", ")}` },
+    });
+  }
+  const effort = parsedEffort
+    ?? (req.body.thinking?.type === "enabled" ? budgetToEffort(req.body.thinking.budget_tokens) : null);
+
   const sessionId = getSession(user);
   const { messages, tools } = anthropicToOpenAI(req.body);
   const inputTokens = JSON.stringify(messages).length / 4 | 0;
 
-  console.log("[ANT]", new Date().toISOString(), user, model, stream ? "stream" : "sync", "msgs:", messages.length);
+  console.log("[ANT]", new Date().toISOString(), user, model, stream ? "stream" : "sync", "effort:", effort || "default", "msgs:", messages.length);
 
-  const buildAnt = () => zenRequest(model, messages, tools, undefined, sessionId, req.body.max_tokens);
+  const buildAnt = () => zenRequest(model, messages, tools, undefined, sessionId, req.body.max_tokens, applyEffort(model, effort, () => {}));
 
   if (stream) {
     pipeZenAsAnthropic(buildAnt, model, res, inputTokens);

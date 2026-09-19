@@ -38,7 +38,7 @@ Smoke test:
 
 ```bash
 curl http://localhost:6446/health
-# {"status":"ok","version":"v11","models":6,...}
+# {"status":"ok","version":"v12","models":6,...}
 ```
 
 ## Models
@@ -55,6 +55,52 @@ curl http://localhost:6446/health
 - Chat models are **also** served on `/v1/messages` (Anthropic format).
 - `muse-spark-*` **only** work on `/v1/responses` (OpenAI Responses API).
 - All models support streaming; `stream: false` is emulated (the proxy always streams upstream and aggregates — the free tier rejects non-streaming requests).
+- Reasoning models (`mimo-v2.5-free`, `muse-spark-*`) support **effort control** — see [Reasoning effort](#reasoning-effort).
+
+### Reasoning effort
+
+Control how much thinking the model does. The proxy exposes the full Zen
+effort scale and normalizes it per model:
+
+| Client API | How to set it |
+|---|---|
+| OpenAI chat | `"reasoning_effort": "low"` (or `"reasoning": {"effort": "low"}`) on `/v1/chat/completions` |
+| OpenAI Responses | `"reasoning": {"effort": "xhigh"}` on `/v1/responses` |
+| Anthropic | `"thinking": {"type": "enabled", "budget_tokens": 10000}` on `/v1/messages` — the proxy maps the budget to the nearest effort tier |
+
+Effort values: `none` · `minimal` · `low` · `medium` · `high` · `xhigh` · `max`
+
+Upstream truth (probed live, not guessed):
+
+* `muse-spark-*` — actually works from `minimal` to `xhigh`. `max` and `none`
+  pass schema validation but the **provider rejects them**; the proxy
+  auto-clamps `max → xhigh` and `none → minimal`, so clients (e.g. Claude
+  Code "max thinking") never see a spurious 4xx. **There is no bypass** —
+  calling `opencode.ai/zen` directly with `max` gets the same rejection. It
+  is a model-side capability limit, not an auth check. `xhigh` is the ceiling.
+* `mimo-v2.5-free` — honours every value including `none`; reasoning tokens
+  scale accordingly (measured: `low` ≈ 17, `xhigh` ≈ 429 reasoning tokens).
+* Non-reasoning models (`big-pickle`, `nemotron`, `ling`) — accept the field
+  and silently ignore it.
+
+Invalid values fail fast at the proxy with `400` listing accepted values.
+
+Anthropic clients also get real **thinking blocks** back: non-streaming,
+`content[0] = { type: "thinking", thinking: ... }` before the text block;
+streaming, `thinking_delta` chunks then a `signature_delta` then
+`content_block_stop`, with correct indices for thinking/text/tool_use.
+
+```bash
+# Responses side — max available thinking on muse (clamped to xhigh)
+curl -s http://localhost:6446/v1/responses -H "Authorization: Bearer YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"muse-spark-1.3-contributor-free","input":"Solve: ...","reasoning":{"effort":"xhigh"}}'
+
+# Chat side — mimo reasoning tier
+curl -s http://localhost:6446/v1/chat/completions -H "Authorization: Bearer YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"mimo-v2.5-free","messages":[{"role":"user","content":"Solve: ..."}],"reasoning_effort":"high"}'
+```
 
 ## API
 
